@@ -5,7 +5,23 @@ import SwiftUI
 import SwiftParser
 import SwiftSyntax
 
-private let sampleText = """
+private enum CodeSampleKind: String, CaseIterable, Identifiable {
+    case swift = "Swift"
+    case javascript = "JavaScript"
+
+    var id: String { rawValue }
+
+    var sampleText: String {
+        switch self {
+        case .swift:
+            swiftSampleText
+        case .javascript:
+            javaScriptSampleText
+        }
+    }
+}
+
+private let swiftSampleText = """
 import Foundation
 
 struct NoteFormatter {
@@ -25,6 +41,18 @@ let summary = ["STTextView", "SwiftUI", "Selection"]
 print(summary)
 """
 
+private let javaScriptSampleText = """
+const toLabel = (value) => `item-${value}`
+
+const summary = ["sttextview", "swiftui", "selection"]
+  .map(toLabel)
+  .filter((value) => value.includes("i"))
+  .join(" / ")
+  .toUpperCase()
+
+console.log(summary)
+"""
+
 @main
 struct STTextViewDemoApp: App {
     init() {
@@ -41,14 +69,26 @@ struct STTextViewDemoApp: App {
 }
 
 private struct ContentView: View {
-    @State private var text = AttributedString(sampleText)
+    @State private var sampleKind: CodeSampleKind = .swift
+    @State private var text = AttributedString(swiftSampleText)
     @State private var selection: NSRange? = NSRange(location: 0, length: 0)
 
     var body: some View {
         VStack(spacing: 12) {
             HStack {
+                Picker("代码", selection: $sampleKind) {
+                    ForEach(CodeSampleKind.allCases) { kind in
+                        Text(kind.rawValue).tag(kind)
+                    }
+                }
+                .frame(width: 150)
+                .onChange(of: sampleKind) { _, newValue in
+                    text = AttributedString(newValue.sampleText)
+                    selection = NSRange(location: 0, length: 0)
+                }
+
                 Button("加载示例") {
-                    text = AttributedString(sampleText)
+                    text = AttributedString(sampleKind.sampleText)
                     selection = NSRange(location: 0, length: 0)
                 }
 
@@ -91,7 +131,11 @@ private struct ContentView: View {
     private func expandSelection() {
         let plainText = String(text.characters)
         let currentSelection = selection ?? NSRange(location: 0, length: 0)
-        selection = expandSelectionToParentSyntaxNode(in: plainText, selection: currentSelection)
+        selection = expandedSelectionRange(
+            in: plainText,
+            selection: currentSelection,
+            sampleKind: sampleKind
+        )
     }
 }
 
@@ -116,11 +160,19 @@ private func duplicateCurrentLineInText(in text: String, selection: NSRange) -> 
     )
 }
 
-private func expandSelectionToParentSyntaxNode(in text: String, selection: NSRange) -> NSRange {
+private func expandedSelectionRange(in text: String, selection: NSRange, sampleKind: CodeSampleKind) -> NSRange {
+    switch sampleKind {
+    case .swift:
+        expandSelectionToSwiftSyntaxNode(in: text, selection: selection)
+    case .javascript:
+        expandSelectionHeuristically(in: text, selection: selection)
+    }
+}
+
+private func expandSelectionToSwiftSyntaxNode(in text: String, selection: NSRange) -> NSRange {
     let root = Parser.parse(source: text)
     let clampedSelection = clamp(selection, to: text)
     let byteSelection = byteRange(in: text, nsRange: clampedSelection)
-    let currentUpperBound = clampedSelection.location + clampedSelection.length
     let normalizedByteSelection =
         byteSelection.lowerBound == byteSelection.upperBound
         ? byteSelection.lowerBound..<byteSelection.lowerBound
@@ -133,20 +185,32 @@ private func expandSelectionToParentSyntaxNode(in text: String, selection: NSRan
         candidates: &candidates
     )
 
-    let sortedCandidates = uniqueRanges(candidates)
-        .filter { $0.location <= clampedSelection.location && $0.location + $0.length >= currentUpperBound }
-        .sorted {
-            if $0.length == $1.length {
-                return $0.location < $1.location
-            }
-            return $0.length < $1.length
-        }
+    return nextExpandedRange(
+        current: clampedSelection,
+        candidates: candidates,
+        text: text
+    )
+}
 
-    if let exactIndex = sortedCandidates.firstIndex(where: { NSEqualRanges($0, clampedSelection) }) {
-        return sortedCandidates.dropFirst(exactIndex + 1).first ?? clampedSelection
+private func expandSelectionHeuristically(in text: String, selection: NSRange) -> NSRange {
+    let clampedSelection = clamp(selection, to: text)
+    let nsText = text as NSString
+    var candidates: [NSRange] = []
+
+    if let wordRange = wordRange(in: text, location: clampedSelection.location) {
+        candidates.append(wordRange)
     }
 
-    return sortedCandidates.first(where: { !NSEqualRanges($0, clampedSelection) }) ?? clampedSelection
+    candidates.append(nsText.lineRange(for: clampedSelection))
+    candidates.append(paragraphBlockRange(in: text, around: clampedSelection))
+    candidates.append(contentsOf: enclosingDelimiterRanges(in: text, around: clampedSelection))
+    candidates.append(NSRange(location: 0, length: nsText.length))
+
+    return nextExpandedRange(
+        current: clampedSelection,
+        candidates: candidates,
+        text: text
+    )
 }
 
 private func collectParentSyntaxSelections(
@@ -173,6 +237,120 @@ private func collectParentSyntaxSelections(
             candidates: &candidates
         )
     }
+}
+
+private func nextExpandedRange(current: NSRange, candidates: [NSRange], text: String) -> NSRange {
+    let currentUpperBound = current.location + current.length
+    let sortedCandidates = uniqueRanges(candidates)
+        .map { clamp($0, to: text) }
+        .filter { $0.location <= current.location && $0.location + $0.length >= currentUpperBound }
+        .sorted {
+            if $0.length == $1.length {
+                return $0.location < $1.location
+            }
+            return $0.length < $1.length
+        }
+
+    if let exactIndex = sortedCandidates.firstIndex(where: { NSEqualRanges($0, current) }) {
+        return sortedCandidates.dropFirst(exactIndex + 1).first ?? current
+    }
+
+    return sortedCandidates.first(where: { !NSEqualRanges($0, current) }) ?? current
+}
+
+private func wordRange(in text: String, location: Int) -> NSRange? {
+    let nsText = text as NSString
+    guard nsText.length > 0 else {
+        return nil
+    }
+
+    let clampedLocation = min(max(location, 0), nsText.length - 1)
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_$"))
+    var lowerBound = clampedLocation
+    var upperBound = clampedLocation
+
+    while lowerBound > 0,
+          let scalar = UnicodeScalar(nsText.character(at: lowerBound - 1)),
+          allowed.contains(scalar)
+    {
+        lowerBound -= 1
+    }
+
+    while upperBound < nsText.length,
+          let scalar = UnicodeScalar(nsText.character(at: upperBound)),
+          allowed.contains(scalar)
+    {
+        upperBound += 1
+    }
+
+    guard upperBound > lowerBound else {
+        return nil
+    }
+
+    return NSRange(location: lowerBound, length: upperBound - lowerBound)
+}
+
+private func paragraphBlockRange(in text: String, around selection: NSRange) -> NSRange {
+    let nsText = text as NSString
+    let lines = text.components(separatedBy: "\n")
+    var currentLocation = 0
+    var selectedLine = 0
+
+    for (index, line) in lines.enumerated() {
+        let nextLocation = currentLocation + (line as NSString).length + (index == lines.count - 1 ? 0 : 1)
+        if selection.location < nextLocation || index == lines.count - 1 {
+            selectedLine = index
+            break
+        }
+        currentLocation = nextLocation
+    }
+
+    var startLine = selectedLine
+    while startLine > 0, !lines[startLine - 1].trimmingCharacters(in: .whitespaces).isEmpty {
+        startLine -= 1
+    }
+
+    var endLine = selectedLine
+    while endLine < lines.count - 1, !lines[endLine + 1].trimmingCharacters(in: .whitespaces).isEmpty {
+        endLine += 1
+    }
+
+    let startOffset = lines.prefix(startLine).reduce(0) { partial, line in
+        partial + (line as NSString).length + 1
+    }
+    let endOffset = lines.prefix(endLine + 1).reduce(0) { partial, line in
+        partial + (line as NSString).length + 1
+    }
+
+    return NSRange(location: startOffset, length: max(min(endOffset, nsText.length) - startOffset, 0))
+}
+
+private func enclosingDelimiterRanges(in text: String, around selection: NSRange) -> [NSRange] {
+    let pairs: [(Character, Character)] = [("(", ")"), ("[", "]"), ("{", "}")]
+    let characters = Array(text)
+    let lowerUTF16 = selection.location
+    let upperUTF16 = selection.location + selection.length
+    var ranges: [NSRange] = []
+
+    for (open, close) in pairs {
+        var stack: [(characterIndex: Int, utf16Offset: Int)] = []
+        var utf16Offset = 0
+
+        for (index, character) in characters.enumerated() {
+            if character == open {
+                stack.append((index, utf16Offset))
+            } else if character == close, let last = stack.popLast() {
+                let closeOffset = utf16Offset + String(character).utf16.count
+                if last.utf16Offset <= lowerUTF16, closeOffset >= upperUTF16 {
+                    ranges.append(NSRange(location: last.utf16Offset, length: closeOffset - last.utf16Offset))
+                }
+            }
+
+            utf16Offset += String(character).utf16.count
+        }
+    }
+
+    return ranges
 }
 
 private func clamp(_ range: NSRange, to text: String) -> NSRange {
